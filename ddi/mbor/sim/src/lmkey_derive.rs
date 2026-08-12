@@ -182,19 +182,17 @@ impl LMKeyDerive {
             &mut masking_key,
         )?;
 
-        // 3. Pre-encode the masking key.
-        let mut pre_encoded = MaskedKey::pre_encode(
+        // 3. Encode the masking key into bmk_out (computes layout, writes header, encrypts, and tags in one call).
+        MaskedKey::encode(
+            env,
             1,
             MaskingKeyAlgorithm::AesCbc256Hmac384,
-            metadata.len(),
-            encrypted_key_len,
+            masking_key.as_slice(),
+            bk,
+            metadata,
             bmk_out[..encoded_length].as_mut(),
         )
-        .map_err(|_| ManticoreError::MaskedKeyPreEncodeFailed)?;
-
-        // 4. Encode the masking key into bmk_out.
-        MaskedKey::encode(env, &mut pre_encoded, masking_key.as_slice(), bk, metadata)
-            .map_err(|_| ManticoreError::MaskedKeyEncodeFailed)?;
+        .map_err(|_| ManticoreError::MaskedKeyEncodeFailed)?;
 
         *bmk_len = encoded_length;
 
@@ -410,19 +408,17 @@ impl LMKeyDerive {
             Err(ManticoreError::OutputBufferTooSmall)?;
         }
 
-        // 1. Pre-encode BK3.
-        let mut pre_encoded = MaskedKey::pre_encode(
+        // 1. Encode BK3 into mbk3_out (computes layout, writes header, encrypts, and tags in one call).
+        MaskedKey::encode(
+            env,
             1,
             MaskingKeyAlgorithm::AesCbc256Hmac384,
-            metadata.len(),
-            encrypted_key_len,
+            bk3,
+            ephemeral_key,
+            metadata,
             mbk3_out[..encoded_length].as_mut(),
         )
-        .map_err(|_| ManticoreError::MaskedKeyPreEncodeFailed)?;
-
-        // 2. Encode the BK3 in mbk3_out buffer.
-        MaskedKey::encode(env, &mut pre_encoded, bk3, ephemeral_key, metadata)
-            .map_err(|_| ManticoreError::MaskedKeyEncodeFailed)?;
+        .map_err(|_| ManticoreError::MaskedKeyEncodeFailed)?;
 
         *mbk3_len = encoded_length;
 
@@ -491,23 +487,15 @@ impl LMKeyDerive {
             &mut masking_key_tmp,
         )?;
 
-        // 2. Pre-encode the ephemeral key.
-        let mut pre_encoded = MaskedKey::pre_encode(
-            1,
-            MaskingKeyAlgorithm::AesCbc256Hmac384,
-            metadata.len(),
-            encrypted_key_len,
-            memphk_out[..encoded_length].as_mut(),
-        )
-        .map_err(|_| ManticoreError::MaskedKeyPreEncodeFailed)?;
-
-        // 3. Encode the ephemeral key into mbk3_out.
+        // 2. Encode the ephemeral key into memphk_out (computes layout, writes header, encrypts, and tags in one call).
         MaskedKey::encode(
             env,
-            &mut pre_encoded,
+            1,
+            MaskingKeyAlgorithm::AesCbc256Hmac384,
             ephemeral_key,
             &masking_key_tmp,
             metadata,
+            memphk_out[..encoded_length].as_mut(),
         )
         .map_err(|_| ManticoreError::MaskedKeyEncodeFailed)?;
 
@@ -1652,12 +1640,11 @@ mod tests {
             &mut mbk3_out,
         );
 
-        // Should fail with invalid parameter error
+        // Should fail with invalid parameter error. Since pre_encode is now an
+        // internal step of the combined encode() call, this surfaces as
+        // MaskedKeyEncodeFailed rather than a separate pre-encode error.
         assert!(result.is_err());
-        assert!(matches!(
-            result,
-            Err(ManticoreError::MaskedKeyPreEncodeFailed)
-        ));
+        assert!(matches!(result, Err(ManticoreError::MaskedKeyEncodeFailed)));
     }
 
     #[test]

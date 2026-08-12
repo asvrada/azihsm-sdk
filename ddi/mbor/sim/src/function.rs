@@ -18,6 +18,7 @@ use azihsm_ddi_mbor_types::DdiKeyType;
 use azihsm_ddi_mbor_types::DdiMaskedKeyAttributes;
 use azihsm_ddi_mbor_types::DdiMaskedKeyMetadata;
 use azihsm_ddi_mbor_types::MaskedKey;
+use azihsm_ddi_mbor_types::MaskedKeyBlob;
 use azihsm_ddi_mbor_types::MaskingKeyAlgorithm;
 use azihsm_ddi_mbor_types::DDI_MAX_KEY_LABEL_LENGTH;
 use parking_lot::RwLock;
@@ -83,12 +84,12 @@ pub(crate) const BKS2: [u8; BK_SEED_SIZE_BYTES] = [
 /// * `metadata` - The metadata for the masked key
 ///
 /// # Returns
-/// * `Result<Vec<u8>, ManticoreError>` - The encoded masked key buffer
+/// * `Result<MaskedKeyBlob, ManticoreError>` - The encoded masked key buffer
 fn encode_masked_key(
     key_data: &[u8],
     masking_key: &[u8],
     metadata: &DdiMaskedKeyMetadata,
-) -> Result<Vec<u8>, ManticoreError> {
+) -> Result<MaskedKeyBlob, ManticoreError> {
     let env = SimCryptEnv;
 
     // MBOR encode metadata
@@ -128,23 +129,15 @@ fn encode_masked_key(
     // Create a buffer of the required length
     let mut buffer = vec![0u8; encoded_length];
 
-    // Pre-encode the masked key
-    let mut pre_encoded = MaskedKey::pre_encode(
-        1,
-        MaskingKeyAlgorithm::AesCbc256Hmac384,
-        metadata_len,
-        encrypted_key_len,
-        &mut buffer,
-    )
-    .map_err(|_| ManticoreError::MaskedKeyPreEncodeFailed)?;
-
-    // Encode the masked key
+    // Encode the masked key (computes the layout, writes the header, encrypts, and tags in one call).
     MaskedKey::encode(
         &env,
-        &mut pre_encoded,
+        1,
+        MaskingKeyAlgorithm::AesCbc256Hmac384,
         key_data,
         masking_key,
         &encoded_metadata,
+        &mut buffer,
     )
     .map_err(|_| ManticoreError::MaskedKeyEncodeFailed)?;
 
@@ -224,7 +217,10 @@ impl Function {
     }
 
     /// Init the BK3
-    pub(crate) fn init_bk3(&self, bk3: [u8; BK3_SIZE_BYTES]) -> Result<Vec<u8>, ManticoreError> {
+    pub(crate) fn init_bk3(
+        &self,
+        bk3: [u8; BK3_SIZE_BYTES],
+    ) -> Result<MaskedKeyBlob, ManticoreError> {
         self.inner.write().init_bk3(bk3)
     }
 
@@ -525,7 +521,7 @@ impl FunctionInner {
         Ok(key_id)
     }
 
-    fn init_bk3(&mut self, bk3: [u8; BK3_SIZE_BYTES]) -> Result<Vec<u8>, ManticoreError> {
+    fn init_bk3(&mut self, bk3: [u8; BK3_SIZE_BYTES]) -> Result<MaskedKeyBlob, ManticoreError> {
         tracing::debug!(bk3_len = bk3.len(), "Initializing BK3");
 
         if self.state.is_bk3_initialized() {

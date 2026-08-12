@@ -1,6 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use core::ops::Range;
+
+extern crate alloc;
+
 use azihsm_ddi_mbor_derive::Ddi;
 use zerocopy::Immutable;
 use zerocopy::IntoBytes;
@@ -19,6 +23,14 @@ pub const AES_CBC_256_KEY_SIZE: usize = 32;
 
 pub const AES_GCM_IV_SIZE: usize = 12;
 pub const AES_GCM_TAG_SIZE: usize = 16;
+
+/// An encoded masked-key blob: the wire-format byte representation produced
+/// by encoding a masked key (header + AES payload + tag) and consumed when
+/// decoding one back via `MaskedKey::decode`. This is a plain alias over
+/// `Vec<u8>` used to make ownership of masked-key buffers self-documenting
+/// at API boundaries; it is not a distinct type and imposes no additional
+/// invariants beyond being a well-formed masked key once fully encoded.
+pub type MaskedKeyBlob = alloc::vec::Vec<u8>;
 
 #[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 #[repr(C, packed)]
@@ -39,7 +51,7 @@ pub struct MaskedKeyHeader {
 #[repr(C, packed)]
 #[derive(Debug, IntoBytes, KnownLayout, PartialEq, Eq, Clone, Copy, TryFromBytes, Immutable)]
 pub struct MaskedKeyAesHeader {
-    /// Length of the metadata in bytes.
+    /// Length of the IV (Initialization Vector) in bytes.
     ///     Integrity protected: Yes, by the integrity tag.
     ///     Encrypted: No.
     pub iv_len: u16,
@@ -128,474 +140,362 @@ const _: () = {
     );
 };
 
-/// Base trait for all masked key types
-pub trait MaskedKeyBase<'a> {
-    /// Returns the header
-    fn header(&self) -> &MaskedKeyHeader;
-
-    /// Returns the encrypted key data
-    fn encrypted_key(&self) -> &[u8];
-
-    /// Returns the metadata
-    fn metadata(&self) -> &[u8];
-
-    /// Returns the algorithm used
-    fn algorithm(&self) -> MaskingKeyAlgorithm;
-}
-
-/// AES-specific masked key
-#[derive(Debug)]
-pub struct MaskedKeyAes<'a> {
-    header: MaskedKeyHeader,
-    layout: MaskedKeyAesLayout,
-    payload: &'a [u8],
-}
-
-impl<'a> MaskedKeyAes<'a> {
-    pub fn new(header: MaskedKeyHeader, layout: MaskedKeyAesLayout, payload: &'a [u8]) -> Self {
-        Self {
-            header,
-            layout,
-            payload,
-        }
-    }
-
-    /// Returns the header
-    pub fn header(&self) -> &MaskedKeyHeader {
-        &self.header
-    }
-
-    /// Returns the layout information
-    pub fn layout(&self) -> &MaskedKeyAesLayout {
-        &self.layout
-    }
-
-    /// Returns the IV (Initialization Vector) slice
-    pub fn iv(&self) -> &[u8] {
-        let payload_data = &self.payload[size_of::<MaskedKeyAesHeader>()..];
-        &payload_data[..self.layout.iv_len]
-    }
-
-    /// Returns the encrypted key data slice
-    pub fn encrypted_key(&self) -> &[u8] {
-        let payload_data = &self.payload[size_of::<MaskedKeyAesHeader>()..];
-        let start = self.layout.iv_len
-            + self.layout.post_iv_pad_len
-            + self.layout.metadata_len
-            + self.layout.post_metadata_pad_len;
-        &payload_data[start..start + self.layout.encrypted_key_len]
-    }
-
-    /// Returns the metadata slice
-    pub fn metadata(&self) -> &[u8] {
-        let payload_data = &self.payload[size_of::<MaskedKeyAesHeader>()..];
-        let start = self.layout.iv_len + self.layout.post_iv_pad_len;
-        &payload_data[start..start + self.layout.metadata_len]
-    }
-
-    /// Returns the authentication tag slice
-    pub fn tag(&self) -> &[u8] {
-        let payload_data = &self.payload[size_of::<MaskedKeyAesHeader>()..];
-        let start = self.layout.iv_len
-            + self.layout.post_iv_pad_len
-            + self.layout.metadata_len
-            + self.layout.post_metadata_pad_len
-            + self.layout.encrypted_key_len
-            + self.layout.post_encrypted_key_pad_len;
-        &payload_data[start..start + self.layout.tag_len]
-    }
-}
-
-/// AES-specific layout
-#[derive(Debug)]
+/// Layout of the variable-length fields that follow `MaskedKeyHeader` +
+/// `MaskedKeyAesHeader` for AES-based masked keys (CBC, GCM).
+///
+/// This is the single source of truth for computing the byte offsets/ranges
+/// of each field within the payload; every accessor on `MaskedKeyAes` and
+/// `PreEncodedMaskedKeyAes` derives its slices from these ranges instead of
+/// re-deriving the arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MaskedKeyAesLayout {
+    pub iv_len: usize,
+    pub post_iv_pad_len: usize,
     pub metadata_len: usize,
     pub post_metadata_pad_len: usize,
     pub encrypted_key_len: usize,
     pub post_encrypted_key_pad_len: usize,
-    pub iv_len: usize,
-    pub post_iv_pad_len: usize,
     pub tag_len: usize,
 }
 
-/// Masked Key Format
-/// This structure represents the format of a masked key, which includes metadata and encrypted key material.
-/// This is a runtime structure that holds references to parsed data, not a wire format.
-#[derive(Debug)]
-pub struct MaskedKey<'a> {
-    /// Masked Key Header.
-    pub header: MaskedKeyHeader,
-
-    /// Pre-computed layout information for efficient access.
-    pub layout: MaskedKeyLayout,
-
-    /// Masked Key Payload.
-    pub payload: &'a [u8],
-}
-
-/// Enum representing different types of key layouts
-#[derive(Debug, Clone)]
-pub enum KeyLayoutType {
-    /// AES-based key layout (CBC, GCM)
-    Aes {
-        iv_len: usize,
-        post_iv_pad_len: usize,
-        tag_len: usize,
-    },
-    // Future: Other key types can be added here
-}
-
-impl KeyLayoutType {
-    /// Returns the total length of key-specific fields
-    pub fn key_specific_len(&self) -> usize {
-        match self {
-            KeyLayoutType::Aes {
-                iv_len,
-                post_iv_pad_len,
-                tag_len,
-            } => size_of::<MaskedKeyAesHeader>() + iv_len + post_iv_pad_len + tag_len,
-        }
-    }
-
-    /// Returns the IV length (if applicable)
-    pub fn iv_len(&self) -> Option<usize> {
-        match self {
-            KeyLayoutType::Aes { iv_len, .. } => Some(*iv_len),
-        }
-    }
-
-    /// Returns the post-IV padding length (if applicable)
-    pub fn post_iv_pad_len(&self) -> Option<usize> {
-        match self {
-            KeyLayoutType::Aes {
-                post_iv_pad_len, ..
-            } => Some(*post_iv_pad_len),
-        }
-    }
-
-    /// Returns the tag length (if applicable)
-    pub fn tag_len(&self) -> Option<usize> {
-        match self {
-            KeyLayoutType::Aes { tag_len, .. } => Some(*tag_len),
-        }
-    }
-}
-
-/// Holds the calculated layout of a masked key.
-#[derive(Debug)]
-pub struct MaskedKeyLayout {
-    // Common fields for all key types
-    metadata_len: usize,
-    post_metadata_pad_len: usize,
-    encrypted_key_len: usize,
-    post_encrypted_key_pad_len: usize,
-
-    // Key-type specific layout
-    pub key_type: KeyLayoutType,
-}
-
-impl MaskedKeyLayout {
-    /// Creates a new AES-based layout
-    pub fn new_aes(
+impl MaskedKeyAesLayout {
+    /// Calculates the layout for a masked key given the algorithm and content
+    /// lengths, aligning each variable-length field to a 4-byte boundary.
+    pub fn calculate(
+        algo: MaskingKeyAlgorithm,
         metadata_len: usize,
-        post_metadata_pad_len: usize,
         encrypted_key_len: usize,
-        post_encrypted_key_pad_len: usize,
-        iv_len: usize,
-        post_iv_pad_len: usize,
-        tag_len: usize,
     ) -> Self {
+        let (iv_len, tag_len) = match algo {
+            MaskingKeyAlgorithm::AesCbc256Hmac384 => (AES_CBC_IV_SIZE, AES_CBC_TAG_SIZE),
+            MaskingKeyAlgorithm::AesGcm256 => (AES_GCM_IV_SIZE, AES_GCM_TAG_SIZE),
+            _ => unreachable!(), // Invalid algorithm, should not happen
+        };
+
         Self {
+            iv_len,
+            post_iv_pad_len: iv_len.next_multiple_of(4) - iv_len,
             metadata_len,
-            post_metadata_pad_len,
+            post_metadata_pad_len: metadata_len.next_multiple_of(4) - metadata_len,
             encrypted_key_len,
-            post_encrypted_key_pad_len,
-            key_type: KeyLayoutType::Aes {
-                iv_len,
-                post_iv_pad_len,
-                tag_len,
-            },
+            post_encrypted_key_pad_len: encrypted_key_len.next_multiple_of(4) - encrypted_key_len,
+            tag_len,
         }
     }
 
-    /// Returns the total length of the masked key structure.
+    /// Returns the total length of the encoded masked key, including both
+    /// `MaskedKeyHeader` and `MaskedKeyAesHeader`.
     pub fn total_len(&self) -> usize {
-        size_of::<MaskedKeyHeader>()
+        size_of::<MaskedKeyHeader>() + size_of::<MaskedKeyAesHeader>() + self.payload_len()
+    }
+
+    /// Returns the length of the variable-length payload that follows both
+    /// headers (IV, metadata, encrypted key, tag, and their padding).
+    pub fn payload_len(&self) -> usize {
+        self.iv_len
+            + self.post_iv_pad_len
             + self.metadata_len
             + self.post_metadata_pad_len
             + self.encrypted_key_len
             + self.post_encrypted_key_pad_len
-            + self.key_type.key_specific_len()
+            + self.tag_len
     }
 
-    /// Returns the IV length (for AES keys)
-    pub fn iv_len(&self) -> usize {
-        self.key_type.iv_len().unwrap_or(0)
+    /// Byte range of the IV within the payload, relative to the start of the
+    /// payload (i.e. right after `MaskedKeyAesHeader`).
+    pub fn iv_range(&self) -> Range<usize> {
+        0..self.iv_len
     }
 
-    /// Returns the post-IV padding length (for AES keys)
-    pub fn post_iv_pad_len(&self) -> usize {
-        self.key_type.post_iv_pad_len().unwrap_or(0)
+    /// Byte range of the post-IV padding within the payload.
+    pub fn post_iv_pad_range(&self) -> Range<usize> {
+        let start = self.iv_range().end;
+        start..start + self.post_iv_pad_len
     }
 
-    /// Returns the tag length (for AES keys)
-    pub fn tag_len(&self) -> usize {
-        self.key_type.tag_len().unwrap_or(0)
+    /// Byte range of the metadata within the payload.
+    pub fn metadata_range(&self) -> Range<usize> {
+        let start = self.post_iv_pad_range().end;
+        start..start + self.metadata_len
     }
 
-    /// Checks if this layout is for an AES key
-    pub fn is_aes(&self) -> bool {
-        matches!(self.key_type, KeyLayoutType::Aes { .. })
+    /// Byte range of the post-metadata padding within the payload.
+    pub fn post_metadata_pad_range(&self) -> Range<usize> {
+        let start = self.metadata_range().end;
+        start..start + self.post_metadata_pad_len
     }
 
-    pub fn metadata_len(&self) -> usize {
-        self.metadata_len
+    /// Byte range of the encrypted key within the payload.
+    pub fn encrypted_key_range(&self) -> Range<usize> {
+        let start = self.post_metadata_pad_range().end;
+        start..start + self.encrypted_key_len
     }
 
-    pub fn post_metadata_pad_len(&self) -> usize {
-        self.post_metadata_pad_len
+    /// Byte range of the post-encrypted-key padding within the payload.
+    pub fn post_encrypted_key_pad_range(&self) -> Range<usize> {
+        let start = self.encrypted_key_range().end;
+        start..start + self.post_encrypted_key_pad_len
     }
 
-    pub fn encrypted_key_len(&self) -> usize {
-        self.encrypted_key_len
+    /// Byte range of the integrity tag within the payload.
+    pub fn tag_range(&self) -> Range<usize> {
+        let start = self.post_encrypted_key_pad_range().end;
+        start..start + self.tag_len
     }
 
-    pub fn post_encrypted_key_pad_len(&self) -> usize {
-        self.post_encrypted_key_pad_len
+    /// Validates that the lengths are self-consistent: non-zero where
+    /// required, a recognized IV size, and each field 4-byte aligned once its
+    /// padding is included.
+    pub fn validate(&self) -> Result<(), MaskedKeyError> {
+        if self.encrypted_key_len == 0 || self.metadata_len == 0 || self.tag_len == 0 {
+            return Err(MaskedKeyError::InvalidLength);
+        }
+
+        if self.iv_len != AES_CBC_IV_SIZE && self.iv_len != AES_GCM_IV_SIZE {
+            return Err(MaskedKeyError::InvalidLength);
+        }
+
+        if !(self.iv_len + self.post_iv_pad_len).is_multiple_of(4)
+            || !(self.metadata_len + self.post_metadata_pad_len).is_multiple_of(4)
+            || !(self.encrypted_key_len + self.post_encrypted_key_pad_len).is_multiple_of(4)
+        {
+            return Err(MaskedKeyError::InvalidLength);
+        }
+
+        Ok(())
     }
 }
 
 impl From<&MaskedKeyAesHeader> for MaskedKeyAesLayout {
     fn from(header: &MaskedKeyAesHeader) -> Self {
         Self {
+            iv_len: header.iv_len as usize,
+            post_iv_pad_len: header.post_iv_pad_len as usize,
             metadata_len: header.metadata_len as usize,
             post_metadata_pad_len: header.post_metadata_pad_len as usize,
             encrypted_key_len: header.encrypted_key_len as usize,
             post_encrypted_key_pad_len: header.post_encrypted_key_pad_len as usize,
-            iv_len: header.iv_len as usize,
-            post_iv_pad_len: header.post_iv_pad_len as usize,
             tag_len: header.tag_len as usize,
         }
     }
 }
 
-/// Pre-encoded masked key structure.
-/// This structure is used to prepare a masked key for encoding.
-/// Contains only methods that are common to all key types.
+/// AES-specific masked key: a read-only, runtime view over decoded masked
+/// key bytes.
 #[derive(Debug)]
-pub struct PreEncodedMaskedKey<'a> {
-    /// The masking key algorithm used for this masked key.
-    algo: MaskingKeyAlgorithm,
-    /// The buffer that holds the masked key data.
-    buffer: &'a mut [u8],
-    /// The calculated layout of the masked key structure.
-    layout: MaskedKeyLayout,
+pub struct MaskedKeyAes<'a> {
+    header: MaskedKeyHeader,
+    layout: MaskedKeyAesLayout,
+    /// The variable-length payload, i.e. the bytes immediately following
+    /// `MaskedKeyAesHeader`.
+    payload: &'a [u8],
 }
 
-/// AES-specific pre-encoded masked key
-#[derive(Debug)]
-pub struct PreEncodeMaskedKeyAes<'a> {
-    /// The base pre-encoded masked key
-    base: PreEncodedMaskedKey<'a>,
-}
-
-/// Enum to handle different pre-encoded masked key types
-#[derive(Debug)]
-pub enum PreEncodeMaskedKeyType<'a> {
-    Aes(PreEncodeMaskedKeyAes<'a>),
-}
-
-impl<'a> PreEncodedMaskedKey<'a> {
-    /// Creates a new `PreEncodeMaskedKey` from the output buffer and layout.
-    pub fn new(algo: MaskingKeyAlgorithm, buffer: &'a mut [u8], layout: MaskedKeyLayout) -> Self {
+impl<'a> MaskedKeyAes<'a> {
+    /// Creates a new `MaskedKeyAes` view.
+    ///
+    /// `payload` must start at the beginning of `MaskedKeyAesHeader` (i.e.
+    /// immediately after `MaskedKeyHeader`) and be at least
+    /// `size_of::<MaskedKeyAesHeader>() + layout.payload_len()` bytes long.
+    pub fn new(header: MaskedKeyHeader, layout: MaskedKeyAesLayout, payload: &'a [u8]) -> Self {
         Self {
-            algo,
-            buffer,
+            header,
             layout,
+            payload: &payload[size_of::<MaskedKeyAesHeader>()..],
         }
     }
 
-    /// Convert to a type-safe enum variant based on the algorithm
-    pub fn into_typed(self) -> PreEncodeMaskedKeyType<'a> {
-        match self.algo {
-            MaskingKeyAlgorithm::AesCbc256Hmac384 | MaskingKeyAlgorithm::AesGcm256 => {
-                PreEncodeMaskedKeyType::Aes(PreEncodeMaskedKeyAes { base: self })
-            }
-            _ => unreachable!("Unsupported algorithm"),
-        }
+    /// Returns the header.
+    pub fn header(&self) -> &MaskedKeyHeader {
+        &self.header
+    }
+
+    /// Returns the layout information.
+    pub fn layout(&self) -> &MaskedKeyAesLayout {
+        &self.layout
+    }
+
+    /// Returns the IV (Initialization Vector) slice.
+    pub fn iv(&self) -> &[u8] {
+        &self.payload[self.layout.iv_range()]
+    }
+
+    /// Returns the encrypted key data slice.
+    pub fn encrypted_key(&self) -> &[u8] {
+        &self.payload[self.layout.encrypted_key_range()]
+    }
+
+    /// Returns the metadata slice.
+    pub fn metadata(&self) -> &[u8] {
+        &self.payload[self.layout.metadata_range()]
+    }
+
+    /// Returns the authentication tag slice.
+    pub fn tag(&self) -> &[u8] {
+        &self.payload[self.layout.tag_range()]
+    }
+}
+
+/// A masked key buffer prepared for encoding: `MaskedKeyHeader` and
+/// `MaskedKeyAesHeader` have already been written, and the variable-length
+/// fields (IV, metadata, encrypted key, tag) can be filled in through the
+/// accessors below.
+#[derive(Debug)]
+pub struct PreEncodedMaskedKeyAes<'a> {
+    algo: MaskingKeyAlgorithm,
+    buffer: &'a mut [u8],
+    layout: MaskedKeyAesLayout,
+}
+
+/// Enum to handle different pre-encoded masked key types.
+#[derive(Debug)]
+pub enum PreEncodedMaskedKeyType<'a> {
+    Aes(PreEncodedMaskedKeyAes<'a>),
+}
+
+impl<'a> PreEncodedMaskedKeyAes<'a> {
+    /// Offset of the variable-length payload within `buffer`, i.e. the
+    /// offset right after `MaskedKeyHeader` + `MaskedKeyAesHeader`.
+    fn payload_offset() -> usize {
+        size_of::<MaskedKeyHeader>() + size_of::<MaskedKeyAesHeader>()
+    }
+
+    fn payload(&self) -> &[u8] {
+        &self.buffer[Self::payload_offset()..]
+    }
+
+    fn payload_mut(&mut self) -> &mut [u8] {
+        let offset = Self::payload_offset();
+        &mut self.buffer[offset..]
     }
 
     /// Returns the masking key algorithm used for this masked key.
     pub fn algo(&self) -> MaskingKeyAlgorithm {
         self.algo
     }
-}
 
-impl PreEncodeMaskedKeyAes<'_> {
+    /// Returns the layout information.
+    pub fn layout(&self) -> &MaskedKeyAesLayout {
+        &self.layout
+    }
+
     /// Returns an immutable slice of the Initialization Vector (IV).
     pub fn iv(&self) -> &[u8] {
-        let start = size_of::<MaskedKeyHeader>() + size_of::<MaskedKeyAesHeader>();
-        let end = start + self.base.layout.iv_len();
-        &self.base.buffer[start..end]
+        &self.payload()[self.layout.iv_range()]
     }
 
     /// Returns a mutable slice of the Initialization Vector (IV).
     pub fn iv_mut(&mut self) -> &mut [u8] {
-        let start = size_of::<MaskedKeyHeader>() + size_of::<MaskedKeyAesHeader>();
-        let end = start + self.base.layout.iv_len();
-        &mut self.base.buffer[start..end]
+        let range = self.layout.iv_range();
+        &mut self.payload_mut()[range]
     }
 
     /// Returns an immutable slice of the encrypted key data.
     pub fn encrypted_key(&self) -> &[u8] {
-        let start = size_of::<MaskedKeyHeader>()
-            + size_of::<MaskedKeyAesHeader>()
-            + self.base.layout.iv_len()
-            + self.base.layout.post_iv_pad_len()
-            + self.base.layout.metadata_len
-            + self.base.layout.post_metadata_pad_len;
-        let end = start + self.base.layout.encrypted_key_len;
-        &self.base.buffer[start..end]
+        &self.payload()[self.layout.encrypted_key_range()]
     }
 
     /// Returns a mutable slice of the encrypted key data.
     pub fn encrypted_key_mut(&mut self) -> &mut [u8] {
-        let start = size_of::<MaskedKeyHeader>()
-            + size_of::<MaskedKeyAesHeader>()
-            + self.base.layout.iv_len()
-            + self.base.layout.post_iv_pad_len()
-            + self.base.layout.metadata_len
-            + self.base.layout.post_metadata_pad_len;
-        let end = start + self.base.layout.encrypted_key_len;
-        &mut self.base.buffer[start..end]
+        let range = self.layout.encrypted_key_range();
+        &mut self.payload_mut()[range]
     }
 
     /// Returns an immutable slice of the metadata.
     pub fn metadata(&self) -> &[u8] {
-        let start = size_of::<MaskedKeyHeader>()
-            + size_of::<MaskedKeyAesHeader>()
-            + self.base.layout.iv_len()
-            + self.base.layout.post_iv_pad_len();
-        let end = start + self.base.layout.metadata_len;
-        &self.base.buffer[start..end]
+        &self.payload()[self.layout.metadata_range()]
     }
 
     /// Returns a mutable slice of the metadata.
     pub fn metadata_mut(&mut self) -> &mut [u8] {
-        let start = size_of::<MaskedKeyHeader>()
-            + size_of::<MaskedKeyAesHeader>()
-            + self.base.layout.iv_len()
-            + self.base.layout.post_iv_pad_len();
-        let end = start + self.base.layout.metadata_len;
-        &mut self.base.buffer[start..end]
+        let range = self.layout.metadata_range();
+        &mut self.payload_mut()[range]
     }
 
     /// Returns an immutable slice of the integrity tag.
     pub fn tag(&self) -> &[u8] {
-        let start: usize = self.base.buffer.len() - self.base.layout.tag_len();
-        &self.base.buffer[start..]
+        &self.payload()[self.layout.tag_range()]
     }
 
     /// Returns a mutable slice of the integrity tag.
     pub fn tag_mut(&mut self) -> &mut [u8] {
-        let start = self.base.buffer.len() - self.base.layout.tag_len();
-        &mut self.base.buffer[start..]
-    }
-
-    /// Returns the masking key algorithm used for this masked key.
-    pub fn algo(&self) -> MaskingKeyAlgorithm {
-        self.base.algo()
+        let range = self.layout.tag_range();
+        &mut self.payload_mut()[range]
     }
 
     /// Returns the data to be tagged based on the algorithm type.
-    /// For AES CBC: everything except the tag itself
-    /// For AES GCM: data up to (but not including) the encrypted_key
+    /// For AES CBC: everything except the tag itself.
+    /// For AES GCM: data up to (but not including) the encrypted_key.
     pub fn tagged_data(&self) -> &[u8] {
-        match self.base.algo {
+        match self.algo {
             MaskingKeyAlgorithm::AesCbc256Hmac384 => {
-                // For AES CBC, tag everything except the tag itself
-                let end = self.base.buffer.len() - self.base.layout.tag_len();
-                &self.base.buffer[..end]
+                // For AES CBC, tag everything except the tag itself.
+                let end = self.buffer.len() - self.layout.tag_len;
+                &self.buffer[..end]
             }
             MaskingKeyAlgorithm::AesGcm256 => {
-                // For AES GCM, tag only up to (but not including) the encrypted_key
-                let end = size_of::<MaskedKeyHeader>()
-                    + size_of::<MaskedKeyAesHeader>()
-                    + self.base.layout.iv_len()
-                    + self.base.layout.post_iv_pad_len()
-                    + self.base.layout.metadata_len
-                    + self.base.layout.post_metadata_pad_len;
-                &self.base.buffer[..end]
+                // For AES GCM, tag only up to (but not including) the encrypted_key.
+                let end = Self::payload_offset() + self.layout.post_metadata_pad_range().end;
+                &self.buffer[..end]
             }
-            _ => {
-                unreachable!()
-            }
+            _ => unreachable!(),
         }
     }
 }
 
-impl PreEncodeMaskedKeyType<'_> {
+impl PreEncodedMaskedKeyType<'_> {
     /// Returns an immutable slice of the encrypted key data.
     pub fn encrypted_key(&self) -> &[u8] {
         match self {
-            PreEncodeMaskedKeyType::Aes(aes) => aes.encrypted_key(),
+            PreEncodedMaskedKeyType::Aes(aes) => aes.encrypted_key(),
         }
     }
 
     /// Returns a mutable slice of the encrypted key data.
     pub fn encrypted_key_mut(&mut self) -> &mut [u8] {
         match self {
-            PreEncodeMaskedKeyType::Aes(aes) => aes.encrypted_key_mut(),
+            PreEncodedMaskedKeyType::Aes(aes) => aes.encrypted_key_mut(),
         }
     }
 
     /// Returns an immutable slice of the metadata.
     pub fn metadata(&self) -> &[u8] {
         match self {
-            PreEncodeMaskedKeyType::Aes(aes) => aes.metadata(),
+            PreEncodedMaskedKeyType::Aes(aes) => aes.metadata(),
         }
     }
 
     /// Returns a mutable slice of the metadata.
     pub fn metadata_mut(&mut self) -> &mut [u8] {
         match self {
-            PreEncodeMaskedKeyType::Aes(aes) => aes.metadata_mut(),
+            PreEncodedMaskedKeyType::Aes(aes) => aes.metadata_mut(),
         }
     }
 
     /// Returns the masking key algorithm used for this masked key.
     pub fn algo(&self) -> MaskingKeyAlgorithm {
         match self {
-            PreEncodeMaskedKeyType::Aes(aes) => aes.algo(),
+            PreEncodedMaskedKeyType::Aes(aes) => aes.algo(),
         }
     }
 
     /// Returns the data to be tagged based on the algorithm type.
     pub fn tagged_data(&self) -> &[u8] {
         match self {
-            PreEncodeMaskedKeyType::Aes(aes) => aes.tagged_data(),
+            PreEncodedMaskedKeyType::Aes(aes) => aes.tagged_data(),
         }
     }
 }
 
-impl<'a> MaskedKey<'a> {
-    /// Creates a new MaskedKey with the provided layout.
-    ///
-    /// # Arguments
-    /// * `header` - The masked key header containing version and algorithm information.
-    /// * `layout` - The layout information for efficient field access.
-    /// * `payload` - The raw payload data containing the AES payload structure and key data.
-    ///
-    /// # Returns
-    /// * `MaskedKey<'a>` - A new MaskedKey instance with the layout information.
-    pub fn new(header: MaskedKeyHeader, layout: MaskedKeyLayout, payload: &'a [u8]) -> Self {
-        Self {
-            header,
-            layout,
-            payload,
-        }
-    }
+/// Namespace for the masked-key encode/decode entry points. This type holds
+/// no state; it exists purely to group the associated functions below
+/// (`encoded_length`, `pre_encode`) and to serve as the target for the
+/// `MaskedKeyEncode`/`MaskedKeyDecode` trait implementations in the
+/// simulator crate.
+#[derive(Debug, Clone, Copy)]
+pub struct MaskedKey;
 
+impl MaskedKey {
     /// Returns the buffer size needed to encode a masked key.
     ///
     /// # Arguments
@@ -610,36 +510,7 @@ impl<'a> MaskedKey<'a> {
         metadata_len: usize,
         encrypted_key_len: usize,
     ) -> usize {
-        Self::calculate_layout(algo, metadata_len, encrypted_key_len).total_len()
-    }
-
-    /// Calculates the layout of the masked key structure.
-    fn calculate_layout(
-        algo: MaskingKeyAlgorithm,
-        metadata_len: usize,
-        encrypted_key_len: usize,
-    ) -> MaskedKeyLayout {
-        let (iv_len, tag_len) = match algo {
-            MaskingKeyAlgorithm::AesCbc256Hmac384 => (AES_CBC_IV_SIZE, AES_CBC_TAG_SIZE),
-            MaskingKeyAlgorithm::AesGcm256 => (AES_GCM_IV_SIZE, AES_GCM_TAG_SIZE),
-            _ => unreachable!(), // Invalid algorithm, should not happen
-        };
-
-        // Calculate padding needed to align each component to a 4-byte boundary.
-        let post_iv_pad_len = iv_len.next_multiple_of(4) - iv_len;
-        let post_metadata_pad_len = metadata_len.next_multiple_of(4) - metadata_len;
-        let post_encrypted_key_pad_len = encrypted_key_len.next_multiple_of(4) - encrypted_key_len;
-
-        // Create AES layout since both current algorithms are AES-based
-        MaskedKeyLayout::new_aes(
-            metadata_len,
-            post_metadata_pad_len,
-            encrypted_key_len,
-            post_encrypted_key_pad_len,
-            iv_len,
-            post_iv_pad_len,
-            tag_len,
-        )
+        MaskedKeyAesLayout::calculate(algo, metadata_len, encrypted_key_len).total_len()
     }
 
     /// Pre-encodes a masked key.
@@ -653,20 +524,20 @@ impl<'a> MaskedKey<'a> {
     /// * `out_data` - The output buffer to hold the pre-encoded masked key.
     ///
     /// # Returns
-    /// * `Result<PreEncodeMaskedKeyType<'a>, MaskedKeyError>` - The pre-encoded masked key structure.
+    /// * `Result<PreEncodedMaskedKeyType<'a>, MaskedKeyError>` - The pre-encoded masked key structure.
     pub fn pre_encode(
         version: u16,
         algo: MaskingKeyAlgorithm,
         metadata_len: usize,
         encrypted_key_len: usize,
         out_data: &mut [u8],
-    ) -> Result<PreEncodeMaskedKeyType<'_>, MaskedKeyError> {
+    ) -> Result<PreEncodedMaskedKeyType<'_>, MaskedKeyError> {
         if encrypted_key_len == 0 {
             Err(MaskedKeyError::InvalidLength)?;
         }
 
         // Calculate the layout of the masked key.
-        let layout = Self::calculate_layout(algo, metadata_len, encrypted_key_len);
+        let layout = MaskedKeyAesLayout::calculate(algo, metadata_len, encrypted_key_len);
 
         // Check if the output buffer is exactly the right size.
         if out_data.len() != layout.total_len() {
@@ -689,20 +560,24 @@ impl<'a> MaskedKey<'a> {
                     MaskedKeyAesHeader::try_mut_from_bytes(aes_payload)
                         .map_err(|_| MaskedKeyError::InvalidLength)?;
 
-                payload.iv_len = layout.iv_len() as u16;
-                payload.post_iv_pad_len = layout.post_iv_pad_len() as u16;
-                payload.metadata_len = layout.metadata_len() as u16;
-                payload.post_metadata_pad_len = layout.post_metadata_pad_len() as u16;
-                payload.encrypted_key_len = layout.encrypted_key_len() as u16;
-                payload.post_encrypted_key_pad_len = layout.post_encrypted_key_pad_len() as u16;
-                payload.tag_len = layout.tag_len() as u16;
+                payload.iv_len = layout.iv_len as u16;
+                payload.post_iv_pad_len = layout.post_iv_pad_len as u16;
+                payload.metadata_len = layout.metadata_len as u16;
+                payload.post_metadata_pad_len = layout.post_metadata_pad_len as u16;
+                payload.encrypted_key_len = layout.encrypted_key_len as u16;
+                payload.post_encrypted_key_pad_len = layout.post_encrypted_key_pad_len as u16;
+                payload.tag_len = layout.tag_len as u16;
             }
             _ => {
                 Err(MaskedKeyError::InvalidAlgorithm)?;
             }
         }
-        let pre_encoded = PreEncodedMaskedKey::new(algo, out_data, layout);
-        Ok(pre_encoded.into_typed())
+
+        Ok(PreEncodedMaskedKeyType::Aes(PreEncodedMaskedKeyAes {
+            algo,
+            buffer: out_data,
+            layout,
+        }))
     }
 }
 

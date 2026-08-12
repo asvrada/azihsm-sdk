@@ -206,34 +206,14 @@ impl HsmMaskedKey {
     ///
     /// Returns `Ok(())` if the header is valid, otherwise returns an error.
     fn validate_aes_header(header: &MaskedKeyAesHeader) -> HsmResult<()> {
-        if header.encrypted_key_len == 0 || header.metadata_len == 0 || header.tag_len == 0 {
-            return Err(HsmError::InternalError);
-        }
-
-        if header.iv_len != AES_CBC_IV_SIZE as u16 && header.iv_len != AES_GCM_IV_SIZE as u16 {
-            return Err(HsmError::InternalError);
-        }
-
-        // Check if the lengths are padded correctly
-        if !(header.iv_len + header.post_iv_pad_len).is_multiple_of(4)
-            || !(header.metadata_len + header.post_metadata_pad_len).is_multiple_of(4)
-            || !(header.encrypted_key_len + header.post_encrypted_key_pad_len).is_multiple_of(4)
-        {
-            return Err(HsmError::InternalError);
-        }
-
-        Ok(())
+        MaskedKeyAesLayout::from(header)
+            .validate()
+            .map_err(|_| HsmError::InternalError)
     }
 
     /// Calculates the total size of the metadata section in the masked key blob.
     fn metadata_size(header: &MaskedKeyAesHeader) -> usize {
-        header.iv_len as usize
-            + header.post_iv_pad_len as usize
-            + header.metadata_len as usize
-            + header.post_metadata_pad_len as usize
-            + header.encrypted_key_len as usize
-            + header.post_encrypted_key_pad_len as usize
-            + header.tag_len as usize
+        MaskedKeyAesLayout::from(header).payload_len()
     }
 
     fn key_props(metadata: &HsmMaskedKeyMetadata, class: HsmKeyClass) -> HsmResult<HsmKeyProps> {

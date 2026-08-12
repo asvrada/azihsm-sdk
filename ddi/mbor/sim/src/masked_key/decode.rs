@@ -74,7 +74,7 @@ pub trait MaskedKeyDecode<'a, Env: CryptEnv>: Sized {
     ) -> Result<DecodedMaskedKey<'a>, MaskedKeyError>;
 }
 
-impl<'a, Env: CryptEnv> MaskedKeyDecode<'a, Env> for MaskedKey<'a> {
+impl<'a, Env: CryptEnv> MaskedKeyDecode<'a, Env> for MaskedKey {
     fn decode(
         env: &Env,
         masking_key: &[u8],
@@ -127,46 +127,24 @@ fn decode_aes<'a, Env: CryptEnv>(
     let (aes_header, payload_data) = MaskedKeyAesHeader::try_ref_from_prefix(aes_data)
         .map_err(|_| MaskedKeyError::HeaderDecodeError)?;
 
-    validate_aes_header(aes_header)?;
-
-    let layout = MaskedKeyAesLayout {
-        metadata_len: aes_header.metadata_len as usize,
-        post_metadata_pad_len: aes_header.post_metadata_pad_len as usize,
-        encrypted_key_len: aes_header.encrypted_key_len as usize,
-        post_encrypted_key_pad_len: aes_header.post_encrypted_key_pad_len as usize,
-        iv_len: aes_header.iv_len as usize,
-        post_iv_pad_len: aes_header.post_iv_pad_len as usize,
-        tag_len: aes_header.tag_len as usize,
-    };
-
-    // Calculate the total expected length from the payload fields.
-    let expected_payload_len = aes_header.iv_len as usize
-        + aes_header.post_iv_pad_len as usize
-        + aes_header.metadata_len as usize
-        + aes_header.post_metadata_pad_len as usize
-        + aes_header.encrypted_key_len as usize
-        + aes_header.post_encrypted_key_pad_len as usize
-        + aes_header.tag_len as usize;
+    let layout = MaskedKeyAesLayout::from(aes_header);
+    layout.validate()?;
 
     // Ensure the payload data length matches the expected length.
-    if payload_data.len() != expected_payload_len {
+    if payload_data.len() != layout.payload_len() {
         return Err(MaskedKeyError::InvalidLength);
     }
 
-    let mut current_offset = size_of::<MaskedKeyHeader>() + size_of::<MaskedKeyAesHeader>();
-
-    // Skip to the tag
-    current_offset += aes_header.iv_len as usize
-        + aes_header.post_iv_pad_len as usize
-        + aes_header.metadata_len as usize
-        + aes_header.post_metadata_pad_len as usize
-        + aes_header.encrypted_key_len as usize
-        + aes_header.post_encrypted_key_pad_len as usize;
+    // Offset of the tag within `full_data`, i.e. right after the encrypted key
+    // (and its padding).
+    let tag_offset = size_of::<MaskedKeyHeader>()
+        + size_of::<MaskedKeyAesHeader>()
+        + layout.post_encrypted_key_pad_range().end;
 
     if integrity_check {
-        if current_offset + aes_header.tag_len as usize <= full_data.len() {
+        if tag_offset + layout.tag_len <= full_data.len() {
             // Create slice for tag.
-            let tag = &full_data[current_offset..current_offset + aes_header.tag_len as usize];
+            let tag = &full_data[tag_offset..tag_offset + layout.tag_len];
 
             // Verify the integrity of masked key.
             match header.algorithm {
@@ -174,7 +152,7 @@ fn decode_aes<'a, Env: CryptEnv>(
                     let (_, hmac_key) = split_aes_hmac_key(masking_key)?;
 
                     let expected_tag = env
-                        .hmac384_tag(hmac_key, &full_data[..current_offset])
+                        .hmac384_tag(hmac_key, &full_data[..tag_offset])
                         .map_err(|_| MaskedKeyError::HmacTagGenerationFailed)?;
                     if expected_tag != tag {
                         Err(MaskedKeyError::HmacTagVerificationFailed)?;

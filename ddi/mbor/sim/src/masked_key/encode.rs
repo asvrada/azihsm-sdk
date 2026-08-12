@@ -4,7 +4,7 @@
 use azihsm_ddi_mbor_types::MaskedKey;
 use azihsm_ddi_mbor_types::MaskedKeyError;
 use azihsm_ddi_mbor_types::MaskingKeyAlgorithm;
-use azihsm_ddi_mbor_types::PreEncodeMaskedKeyType;
+use azihsm_ddi_mbor_types::PreEncodedMaskedKeyType;
 use azihsm_ddi_mbor_types::AES_CBC_IV_SIZE;
 
 use super::*;
@@ -12,37 +12,56 @@ use crate::crypto_env::CryptEnv;
 
 /// A trait for encoding a `MaskedKey` into a raw byte representation.
 pub trait MaskedKeyEncode<Env: CryptEnv> {
-    /// Encodes a `MaskedKey` into a byte slice.
+    /// Encodes a masked key directly into `out_data`: computes the layout,
+    /// writes the header and AES payload header, encrypts `plaintext_key`,
+    /// and generates the integrity tag — in a single call.
     ///
     /// # Arguments
     /// * `env`: The cryptographic environment used for encoding.
-    /// * `pre_encoded_key`: A mutable reference to the pre-encoded masked key structure.
+    /// * `version`: The version of the masked key format.
+    /// * `algo`: The masking key algorithm to use.
     /// * `plaintext_key`: The key to be masked.
     /// * `masking_key`: The key to be used for encrypting the plaintext key.
     /// * `metadata`: Metadata associated with the masked key.
+    /// * `out_data`: The output buffer to encode into. Must be exactly
+    ///   `MaskedKey::encoded_length(algo, metadata.len(), <encrypted key len>)`
+    ///   bytes long.
     ///
     /// # Returns
     /// * `Result<(), MaskedKeyError>` - Ok if encoding is successful, or an error if it fails.
+    #[allow(clippy::too_many_arguments)]
     fn encode(
         env: &Env,
-        pre_encoded_key: &mut PreEncodeMaskedKeyType<'_>,
+        version: u16,
+        algo: MaskingKeyAlgorithm,
         plaintext_key: &[u8],
         masking_key: &[u8],
         metadata: &[u8],
+        out_data: &mut [u8],
     ) -> Result<(), MaskedKeyError>;
 }
 
-impl<Env: CryptEnv> MaskedKeyEncode<Env> for MaskedKey<'_> {
+impl<Env: CryptEnv> MaskedKeyEncode<Env> for MaskedKey {
     fn encode(
         env: &Env,
-        pre_encoded_key: &mut PreEncodeMaskedKeyType<'_>,
+        version: u16,
+        algo: MaskingKeyAlgorithm,
         plaintext_key: &[u8],
         masking_key: &[u8],
         metadata: &[u8],
+        out_data: &mut [u8],
     ) -> Result<(), MaskedKeyError> {
-        match pre_encoded_key.algo() {
+        match algo {
             MaskingKeyAlgorithm::AesCbc256Hmac384 => {
-                encode_aescbc256(env, pre_encoded_key, plaintext_key, masking_key, metadata)?;
+                let encrypted_key_len = env.aescbc256_enc_data_len(plaintext_key.len());
+                let mut pre_encoded = MaskedKey::pre_encode(
+                    version,
+                    algo,
+                    metadata.len(),
+                    encrypted_key_len,
+                    out_data,
+                )?;
+                encode_aescbc256(env, &mut pre_encoded, plaintext_key, masking_key, metadata)?;
             }
             _ => Err(MaskedKeyError::InvalidMaskingKeyAlgorithm)?,
         }
@@ -54,13 +73,13 @@ impl<Env: CryptEnv> MaskedKeyEncode<Env> for MaskedKey<'_> {
 /// Encodes a masked key using AES-CBC-256 with HMAC-384.
 fn encode_aescbc256<Env: CryptEnv>(
     env: &Env,
-    pre_encoded_key: &mut PreEncodeMaskedKeyType<'_>,
+    pre_encoded_key: &mut PreEncodedMaskedKeyType<'_>,
     plaintext_key: &[u8],
     masking_key: &[u8],
     metadata: &[u8],
 ) -> Result<(), MaskedKeyError> {
     // Extract the AES-specific key for type-safe operations
-    let PreEncodeMaskedKeyType::Aes(aes_key) = pre_encoded_key;
+    let PreEncodedMaskedKeyType::Aes(aes_key) = pre_encoded_key;
 
     // Encrypt the plaintext key using AES-CBC-256.
     let mut iv_tmp = [0u8; AES_CBC_IV_SIZE];
@@ -201,7 +220,7 @@ mod tests {
         let mut pre_encoded = result.unwrap();
 
         // Extract the AES key for testing
-        let PreEncodeMaskedKeyType::Aes(aes_key) = &mut pre_encoded;
+        let PreEncodedMaskedKeyType::Aes(aes_key) = &mut pre_encoded;
 
         assert_eq!(aes_key.iv().len(), AES_CBC_IV_SIZE);
         assert_eq!(aes_key.encrypted_key().len(), encrypted_key_len);
@@ -248,32 +267,18 @@ mod tests {
         );
         assert!(encoded_length.is_multiple_of(4));
         let mut buffer = vec![0u8; encoded_length];
-        let result = MaskedKey::pre_encode(
-            1,
-            MaskingKeyAlgorithm::AesCbc256Hmac384,
-            encoded_metadata.len(),
-            encrypted_key_len,
-            &mut buffer,
-        );
-        assert!(result.is_ok());
-        let mut pre_encoded = result.unwrap();
-
-        // Extract the AES key for testing
-        let PreEncodeMaskedKeyType::Aes(aes_key) = &pre_encoded;
-
-        assert_eq!(aes_key.iv().len(), AES_CBC_IV_SIZE);
-        assert_eq!(aes_key.encrypted_key().len(), encrypted_key_len);
-        assert_eq!(aes_key.tag().len(), AES_CBC_TAG_SIZE);
 
         let env = CryptoTestEnv::new();
-        // Encode the MaskedKey
+        // Encode the MaskedKey in a single combined call.
         let plaintext_key = vec![1u8; plaintext_key_len];
         let result = MaskedKey::encode(
             &env,
-            &mut pre_encoded,
+            1,
+            MaskingKeyAlgorithm::AesCbc256Hmac384,
             plaintext_key.as_slice(),
             &AES256_HMAC384_COMBO_KEY,
             &encoded_metadata,
+            &mut buffer,
         );
         assert!(result.is_ok());
 
@@ -361,34 +366,20 @@ mod tests {
         );
         assert!(encoded_length.is_multiple_of(4));
         let mut buffer = vec![0u8; encoded_length];
-        let result = MaskedKey::pre_encode(
-            1,
-            MaskingKeyAlgorithm::AesCbc256Hmac384,
-            encoded_metadata.len(),
-            encrypted_key_len,
-            &mut buffer,
-        );
-        assert!(result.is_ok());
-        let mut pre_encoded = result.unwrap();
-
-        // Extract the AES key for testing
-        let PreEncodeMaskedKeyType::Aes(aes_key) = &pre_encoded;
-
-        assert_eq!(aes_key.iv().len(), AES_CBC_IV_SIZE);
-        assert_eq!(aes_key.encrypted_key().len(), encrypted_key_len);
-        assert_eq!(aes_key.tag().len(), AES_CBC_TAG_SIZE);
 
         let wrong_combo_key = vec![0xFF; 80];
 
         let env = CryptoTestEnv::new();
-        // Encode the MaskedKey
+        // Encode the MaskedKey in a single combined call.
         let plaintext_key = vec![1u8; plaintext_key_len];
         let result = MaskedKey::encode(
             &env,
-            &mut pre_encoded,
+            1,
+            MaskingKeyAlgorithm::AesCbc256Hmac384,
             plaintext_key.as_slice(),
             &wrong_combo_key,
             &encoded_metadata,
+            &mut buffer,
         );
         assert!(result.is_ok());
 
